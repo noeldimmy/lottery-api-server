@@ -1,4 +1,5 @@
 // index.js — Lottery API Server (NO scraping) using Magayo
+
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
@@ -10,13 +11,13 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// ✅ METE API KEY LA LA A (tanporè). Ranplase placeholder la ak key ou.
+// ✅ KOLE API KEY OU ISIT LA (ant guillemets yo)
 const MAGAYO_API_KEY = "LdmqpX6izpWSXLtSe8";
 
 const MAGAYO_RESULTS_URL = "https://www.magayo.com/api/results.php";
 const TZ = "America/New_York";
 
-// Cache 60 seconds pou diminye request yo
+// Cache 60 sec
 let CACHE = { ts: 0, data: null };
 const CACHE_MS = 60 * 1000;
 
@@ -28,7 +29,6 @@ function nextTargetISO(hour, minute) {
 }
 
 function toDateStr(draw) {
-  // draw Magayo souvan "YYYY-MM-DD"
   if (!draw) return "";
   const m = moment.tz(draw, "YYYY-MM-DD", TZ);
   return m.isValid() ? m.format("dddd, DD MMM YYYY") : String(draw);
@@ -36,32 +36,27 @@ function toDateStr(draw) {
 
 function parseBalls(results, digits = 3) {
   if (!results || typeof results !== "string") return [];
-
-  // pran premye pati a si gen plis pase 1
   const first = results.split(";")[0].trim();
 
-  // si gen vigil: "4,3,4"
   if (first.includes(",")) {
     return first.split(",").map(s => s.trim()).filter(Boolean);
   }
 
-  // si se chif kole: "434"
   const onlyDigits = first.replace(/\D/g, "");
   if (digits && onlyDigits.length === digits) return onlyDigits.split("");
 
-  // fallback
   return onlyDigits ? [onlyDigits] : [];
 }
 
 async function magayo(game) {
-  if (!MAGAYO_API_KEY || MAGAYO_API_KEY === "LdmqpX6izpWSXLtSe8") {
-    throw new Error("Ou poko mete MAGAYO API key la nan index.js.");
+  if (!MAGAYO_API_KEY || MAGAYO_API_KEY.includes("LdmqpX6izpWSXLtSe8")) {
+    throw new Error("Ou poko kole MAGAYO API key la nan index.js.");
   }
 
   const res = await axios.get(MAGAYO_RESULTS_URL, {
     params: { api_key: MAGAYO_API_KEY, game },
     timeout: 15000,
-    headers: { Accept: "application/json" },
+    headers: { Accept: "application/json" }
   });
 
   const data = res.data || {};
@@ -74,26 +69,25 @@ async function magayo(game) {
   };
 }
 
-// ✅ Jwèt (midi + aswè) pou FL / NY / GA
+// ✅ Konfig jwèt yo (FL / NY / GA)
 const CONFIG = [
   {
     state: "Florida Lottery",
     midi: { label: "Pick 3 Midday", game: "us_fl_cash3_mid", time: { hour: 13, minute: 30 }, digits: 3 },
-    aswe: { label: "Pick 3 Evening", game: "us_fl_cash3_eve", time: { hour: 21, minute: 45 }, digits: 3 },
+    aswe: { label: "Pick 3 Evening", game: "us_fl_cash3_eve", time: { hour: 21, minute: 45 }, digits: 3 }
   },
   {
     state: "New York Lottery",
     midi: { label: "Numbers Midday", game: "us_ny_numbers_mid", time: { hour: 14, minute: 30 }, digits: 3 },
-    aswe: { label: "Numbers Evening", game: "us_ny_numbers_eve", time: { hour: 22, minute: 30 }, digits: 3 },
+    aswe: { label: "Numbers Evening", game: "us_ny_numbers_eve", time: { hour: 22, minute: 30 }, digits: 3 }
   },
   {
     state: "Georgia Lottery",
     midi: { label: "Cash 3 Midday", game: "us_ga_cash3_mid", time: { hour: 12, minute: 29 }, digits: 3 },
-    // Aswè: mwen mete "Night" pou se dènye tiraj la.
-    aswe: { label: "Cash 3 Night", game: "us_ga_cash3_night", time: { hour: 23, minute: 34 }, digits: 3 },
-    // Si ou pito Evening, ranplase 2 liy anlè yo pa:
-    // aswe: { label: "Cash 3 Evening", game: "us_ga_cash3_eve", time: { hour: 18, minute: 34 }, digits: 3 },
-  },
+    aswe: { label: "Cash 3 Night", game: "us_ga_cash3_night", time: { hour: 23, minute: 34 }, digits: 3 }
+    // Si ou pito Evening, itilize:
+    // aswe: { label: "Cash 3 Evening", game: "us_ga_cash3_eve", time: { hour: 18, minute: 34 }, digits: 3 }
+  }
 ];
 
 async function buildItem(cfg) {
@@ -115,19 +109,17 @@ async function buildItem(cfg) {
     asweBalls,
     asweTarget: nextTargetISO(cfg.aswe.time.hour, cfg.aswe.time.minute),
 
-    // Debug: pou ou wè si Magayo ap voye erè
+    // debug: pou nou wè si Magayo ap voye erè
     midiError: m1.error,
     midiMessage: m1.message,
     asweError: m2.error,
-    asweMessage: m2.message,
+    asweMessage: m2.message
   };
 }
 
-app.get("/", (req, res) => {
-  res.json({ ok: true, message: "Lottery API Server (Magayo) running." });
-});
+app.get("/", (req, res) => res.json({ ok: true, message: "Lottery API Server running" }));
 
-// ✅ Debug route: teste nenpòt game code dirèk
+// ✅ Debug route: teste nenpòt game code
 app.get("/debug/:game", async (req, res) => {
   try {
     const game = String(req.params.game || "").trim();
