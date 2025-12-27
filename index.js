@@ -11,7 +11,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// ✅ KOLE API KEY OU ISIT LA (ant guillemets yo)
+// ✅ API KEY la anndan kòd la (tanporè)
 const MAGAYO_API_KEY = "LdmqpX6izpWSXLtSe8";
 
 const MAGAYO_RESULTS_URL = "https://www.magayo.com/api/results.php";
@@ -39,7 +39,7 @@ function parseBalls(results, digits = 3) {
   const first = results.split(";")[0].trim();
 
   if (first.includes(",")) {
-    return first.split(",").map(s => s.trim()).filter(Boolean);
+    return first.split(",").map((s) => s.trim()).filter(Boolean);
   }
 
   const onlyDigits = first.replace(/\D/g, "");
@@ -48,15 +48,16 @@ function parseBalls(results, digits = 3) {
   return onlyDigits ? [onlyDigits] : [];
 }
 
+// ✅ FIX: pa gen includes() ankò — sa t ap bloke tout bagay
 async function magayo(game) {
-  if (!MAGAYO_API_KEY || MAGAYO_API_KEY.includes("LdmqpX6izpWSXLtSe8")) {
-    throw new Error("Ou poko kole MAGAYO API key la nan index.js.");
+  if (!MAGAYO_API_KEY) {
+    throw new Error("MAGAYO API key la vid nan index.js.");
   }
 
   const res = await axios.get(MAGAYO_RESULTS_URL, {
     params: { api_key: MAGAYO_API_KEY, game },
     timeout: 15000,
-    headers: { Accept: "application/json" }
+    headers: { Accept: "application/json" },
   });
 
   const data = res.data || {};
@@ -65,7 +66,7 @@ async function magayo(game) {
     message: data.message ?? data.msg ?? "",
     draw: data.draw ?? "",
     results: data.results ?? "",
-    raw: data
+    raw: data,
   };
 }
 
@@ -74,28 +75,28 @@ const CONFIG = [
   {
     state: "Florida Lottery",
     midi: { label: "Pick 3 Midday", game: "us_fl_cash3_mid", time: { hour: 13, minute: 30 }, digits: 3 },
-    aswe: { label: "Pick 3 Evening", game: "us_fl_cash3_eve", time: { hour: 21, minute: 45 }, digits: 3 }
+    aswe: { label: "Pick 3 Evening", game: "us_fl_cash3_eve", time: { hour: 21, minute: 45 }, digits: 3 },
   },
   {
     state: "New York Lottery",
     midi: { label: "Numbers Midday", game: "us_ny_numbers_mid", time: { hour: 14, minute: 30 }, digits: 3 },
-    aswe: { label: "Numbers Evening", game: "us_ny_numbers_eve", time: { hour: 22, minute: 30 }, digits: 3 }
+    aswe: { label: "Numbers Evening", game: "us_ny_numbers_eve", time: { hour: 22, minute: 30 }, digits: 3 },
   },
   {
     state: "Georgia Lottery",
     midi: { label: "Cash 3 Midday", game: "us_ga_cash3_mid", time: { hour: 12, minute: 29 }, digits: 3 },
-    aswe: { label: "Cash 3 Night", game: "us_ga_cash3_night", time: { hour: 23, minute: 34 }, digits: 3 }
-    // Si ou pito Evening, itilize:
+    aswe: { label: "Cash 3 Night", game: "us_ga_cash3_night", time: { hour: 23, minute: 34 }, digits: 3 },
+    // Si ou pito Evening:
     // aswe: { label: "Cash 3 Evening", game: "us_ga_cash3_eve", time: { hour: 18, minute: 34 }, digits: 3 }
-  }
+  },
 ];
 
 async function buildItem(cfg) {
   const [m1, m2] = await Promise.all([magayo(cfg.midi.game), magayo(cfg.aswe.game)]);
   const dateStr = toDateStr(m1.draw || m2.draw);
 
-  const midiBalls = (m1.error === 0) ? parseBalls(m1.results, cfg.midi.digits) : [];
-  const asweBalls = (m2.error === 0) ? parseBalls(m2.results, cfg.aswe.digits) : [];
+  const midiBalls = m1.error === 0 ? parseBalls(m1.results, cfg.midi.digits) : [];
+  const asweBalls = m2.error === 0 ? parseBalls(m2.results, cfg.aswe.digits) : [];
 
   return {
     state: cfg.state,
@@ -109,11 +110,11 @@ async function buildItem(cfg) {
     asweBalls,
     asweTarget: nextTargetISO(cfg.aswe.time.hour, cfg.aswe.time.minute),
 
-    // debug: pou nou wè si Magayo ap voye erè
+    // Debug: si Magayo ap voye erè, w ap wè li nan JSON la
     midiError: m1.error,
     midiMessage: m1.message,
     asweError: m2.error,
-    asweMessage: m2.message
+    asweMessage: m2.message,
   };
 }
 
@@ -132,7 +133,7 @@ app.get("/debug/:game", async (req, res) => {
 app.get("/results", async (req, res) => {
   try {
     const now = Date.now();
-    if (CACHE.data && (now - CACHE.ts) < CACHE_MS) return res.json(CACHE.data);
+    if (CACHE.data && now - CACHE.ts < CACHE_MS) return res.json(CACHE.data);
 
     const items = await Promise.all(CONFIG.map(buildItem));
     const payload = { items, updatedAt: new Date().toISOString() };
