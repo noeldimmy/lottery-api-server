@@ -7,26 +7,27 @@ const moment = require('moment-timezone');
 const app = express();
 app.use(cors());
 
-// Fonksyon Scraping ki pi solid
-async function scrapeData(state) {
+// Fonksyon Scraping sou yon sous ki pi lejè (ka rale rezilta jodi a)
+async function getBalls(state) {
     try {
-        // Nou itilize lotteryusa paske li pi estab pou scraping senp
-        const url = `https://www.lotteryusa.com/${state}/`;
+        // Nou itilize yon sous ki bay rezilta rapid san blokaj
+        const url = `https://www.lotterypost.com/results/${state}`;
         const { data } = await axios.get(url, {
             headers: { 'User-Agent': 'Mozilla/5.0' }
         });
         const $ = cheerio.load(data);
         
-        let numbers = [];
-        // Selektè sa a vize boul ki fèk soti yo
-        $('.draw-result .ball').each((i, el) => {
+        let results = [];
+        // Selektè sa a vize ti wonn boul yo sou sit sa a
+        $('.resultsDrawNumbers li').each((i, el) => {
             let n = $(el).text().trim();
-            if (n && !isNaN(n)) numbers.push(n.padStart(2, '0'));
+            if (n && !isNaN(n)) results.push(n.padStart(2, '0'));
         });
         
-        return numbers.length >= 3 ? numbers : null;
+        // Si nou jwenn boul, nou pran 3 premye yo pou chak tiraj
+        return results.length > 0 ? results : null;
     } catch (e) {
-        console.log(`Error scraping ${state}:`, e.message);
+        console.log(`Erè pou ${state}:`, e.message);
         return null;
     }
 }
@@ -35,12 +36,11 @@ app.get('/results', async (req, res) => {
     const nyNow = moment().tz("America/New_York");
     const dateQuery = req.query.date || nyNow.format("YYYY-MM-DD");
 
-    // Rale done yo an paralèl
-    const [flBalls, nyBalls, gaBalls, njBalls] = await Promise.all([
-        scrapeData('florida'),
-        scrapeData('new-york'),
-        scrapeData('georgia'),
-        scrapeData('new-jersey')
+    // Rale done yo pou chak eta
+    const [flRaw, nyRaw, gaRaw] = await Promise.all([
+        getBalls('fl'),
+        getBalls('ny'),
+        getBalls('ga')
     ]);
 
     const getTarget = (h, m) => {
@@ -54,30 +54,30 @@ app.get('/results', async (req, res) => {
             state: "Florida Lottery",
             dateStr: moment(dateQuery).format("dddd, D MMM YYYY"),
             gameMidi: "Florida | MIDI",
-            midiBalls: flBalls ? flBalls.slice(0, 3) : [], 
+            midiBalls: flRaw ? flRaw.slice(0, 3) : [], 
             midiTarget: getTarget(13, 35),
             gameAswe: "Florida | ASWÈ",
-            asweBalls: flBalls ? flBalls.slice(0, 3) : [],
+            asweBalls: flRaw ? flRaw.slice(3, 6) : [],
             asweTarget: getTarget(21, 50),
         },
         {
             state: "New York Lottery",
             dateStr: moment(dateQuery).format("dddd, D MMM YYYY"),
             gameMidi: "New York | MIDI",
-            midiBalls: nyBalls ? nyBalls.slice(0, 3) : [],
+            midiBalls: nyRaw ? nyRaw.slice(0, 3) : [],
             midiTarget: getTarget(14, 30),
             gameAswe: "New York | ASWÈ",
-            asweBalls: nyBalls ? nyBalls.slice(0, 3) : [],
+            asweBalls: nyRaw ? nyRaw.slice(3, 6) : [],
             asweTarget: getTarget(22, 30),
         },
         {
             state: "Georgia Lottery",
             dateStr: moment(dateQuery).format("dddd, D MMM YYYY"),
             gameMidi: "Georgia | MIDI",
-            midiBalls: gaBalls ? gaBalls.slice(0, 3) : [],
+            midiBalls: gaRaw ? gaRaw.slice(0, 3) : [],
             midiTarget: getTarget(12, 29),
             gameAswe: "Georgia | ASWÈ",
-            asweBalls: gaBalls ? gaBalls.slice(0, 3) : [],
+            asweBalls: gaRaw ? gaRaw.slice(3, 6) : [],
             asweTarget: getTarget(23, 34),
         }
     ];
@@ -85,4 +85,7 @@ app.get('/results', async (req, res) => {
     res.json({ items });
 });
 
-app.listen(process.env.PORT || 3000);
+app.get('/', (req, res) => res.send("Sèvè Waldorf ON - Ale sou /results"));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("Sèvè a limen!"));
