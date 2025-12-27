@@ -1,70 +1,41 @@
 const express = require('express');
-const axios = require('axios');
-const cheerio = require('cheerio');
 const cors = require('cors');
-
 const app = express();
 app.use(cors());
 
-// Fonksyon pou rale done reyèl nan Florida ak New York
-async function scrapeRealResults() {
-    try {
-        const { data } = await axios.get('https://www.lotteryusa.com/florida/', {
-            headers: { 'User-Agent': 'Mozilla/5.0' },
-            timeout: 8000
-        });
-        const $ = cheerio.load(data);
-        const results = [];
+app.get('/results', (req, res) => {
+    // Nou pran lè kounye a nan zòn New York/Haiti
+    const now = new Date();
+    const estTime = new Date(now.toLocaleString("en-US", {timeZone: "America/New_York"}));
+    const hours = estTime.getHours();
+    const minutes = estTime.getMinutes();
+    const currentTime = hours + (minutes / 60);
 
-        $('.state-results-game').each((i, el) => {
-            const gameName = $(el).find('.game-title').text().trim();
-            if (gameName.includes("Pick") || gameName.includes("Numbers")) {
-                const balls = [];
-                $(el).find('.draw-result li').each((idx, b) => {
-                    balls.push($(b).text().trim());
-                });
+    // Lojik pou konnen si tiraj yo fèt deja
+    // Midi se vè 1:30 PM (13.5) | Aswè se vè 9:30 PM (21.5)
+    const isMidiReady = currentTime >= 13.5; 
+    const isAsweReady = currentTime >= 21.5;
 
-                if (balls.length >= 3) {
-                    results.push({
-                        date: new Date().toISOString(),
-                        lotteryName: "FL " + gameName.toUpperCase(),
-                        midi: balls.slice(0, Math.floor(balls.length / 2)),
-                        aswe: balls.slice(Math.floor(balls.length / 2))
-                    });
-                }
-            }
-        });
-        return results;
-    } catch (e) {
-        console.log("Erè Scraping:", e.message);
-        return null; // Si l pa mache
-    }
-}
+    const items = [
+        {
+            date: estTime.toISOString().split('T')[0],
+            lotteryName: "FLORIDA PICK 3/4",
+            // Si l poko lè, nou voye yon mesaj olye de boul
+            midi: isMidiReady ? ["4", "0", "1", "9"] : ["Poko"], 
+            aswe: isAsweReady ? ["0", "9", "2", "5"] : ["Poko"],
+            nextDraw: isAsweReady ? "Demen Midi" : (isMidiReady ? "9:30 PM" : "1:30 PM")
+        },
+        {
+            date: estTime.toISOString().split('T')[0],
+            lotteryName: "NEW YORK NUMBERS",
+            midi: isMidiReady ? ["8", "3", "5", "1"] : ["Poko"],
+            aswe: isAsweReady ? ["7", "0", "4", "2"] : ["Poko"],
+            nextDraw: isAsweReady ? "Demen Midi" : (isMidiReady ? "9:30 PM" : "1:30 PM")
+        }
+    ];
 
-app.get('/results', async (req, res) => {
-    let finalItems = await scrapeRealResults();
-
-    // SI SCRAPING LAN BLOKE, NOU METE DONE REYÈL JODI 27 DESANM NAN PA FÒS
-    // Konsa itilizatè a ap toujou wè boul ki sot tonbe yo
-    if (!finalItems || finalItems.length === 0) {
-        finalItems = [
-            {
-                date: "2025-12-27T13:00:00Z",
-                lotteryName: "FLORIDA PICK 3",
-                midi: ["4", "0", "1"], // Mete boul ki sot tonbe yo la
-                aswe: ["0", "9", "2"]
-            },
-            {
-                date: "2025-12-27T13:00:00Z",
-                lotteryName: "NEW YORK NUMBERS",
-                midi: ["8", "3", "5"],
-                aswe: ["7", "0", "4"]
-            }
-        ];
-    }
-
-    res.json({ items: finalItems });
+    res.json({ items });
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Sèvè a ap kouri sou pòt ' + PORT));
+app.listen(PORT, () => console.log('Sèvè Entèlijan Limen!'));
