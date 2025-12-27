@@ -7,27 +7,27 @@ const moment = require('moment-timezone');
 const app = express();
 app.use(cors());
 
-// Fonksyon Scraping sou yon sous ki pi lejè (ka rale rezilta jodi a)
-async function getBalls(state) {
+async function scrapeLottery(stateCode) {
     try {
-        // Nou itilize yon sous ki bay rezilta rapid san blokaj
-        const url = `https://www.lotterypost.com/results/${state}`;
+        // Sous sa a pi fasil pou rale san blokaj
+        const url = `https://www.lotteryusa.com/${stateCode}/`;
         const { data } = await axios.get(url, {
-            headers: { 'User-Agent': 'Mozilla/5.0' }
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36'
+            }
         });
         const $ = cheerio.load(data);
-        
         let results = [];
-        // Selektè sa a vize ti wonn boul yo sou sit sa a
-        $('.resultsDrawNumbers li').each((i, el) => {
-            let n = $(el).text().trim();
-            if (n && !isNaN(n)) results.push(n.padStart(2, '0'));
+
+        // Chèche ti wonn ki gen boul yo
+        $('.draw-result ul li').each((i, el) => {
+            let val = $(el).text().trim();
+            if (val && !isNaN(val)) results.push(val.padStart(2, '0'));
         });
-        
-        // Si nou jwenn boul, nou pran 3 premye yo pou chak tiraj
+
         return results.length > 0 ? results : null;
     } catch (e) {
-        console.log(`Erè pou ${state}:`, e.message);
+        console.error(`Erè rale done ${stateCode}:`, e.message);
         return null;
     }
 }
@@ -38,9 +38,9 @@ app.get('/results', async (req, res) => {
 
     // Rale done yo pou chak eta
     const [flRaw, nyRaw, gaRaw] = await Promise.all([
-        getBalls('fl'),
-        getBalls('ny'),
-        getBalls('ga')
+        scrapeLottery('florida'),
+        scrapeLottery('new-york'),
+        scrapeLottery('georgia')
     ]);
 
     const getTarget = (h, m) => {
@@ -49,43 +49,33 @@ app.get('/results', async (req, res) => {
         return t.toISOString();
     };
 
-    const items = [
-        {
-            state: "Florida Lottery",
-            dateStr: moment(dateQuery).format("dddd, D MMM YYYY"),
-            gameMidi: "Florida | MIDI",
-            midiBalls: flRaw ? flRaw.slice(0, 3) : [], 
-            midiTarget: getTarget(13, 35),
-            gameAswe: "Florida | ASWÈ",
-            asweBalls: flRaw ? flRaw.slice(3, 6) : [],
-            asweTarget: getTarget(21, 50),
-        },
-        {
-            state: "New York Lottery",
-            dateStr: moment(dateQuery).format("dddd, D MMM YYYY"),
-            gameMidi: "New York | MIDI",
-            midiBalls: nyRaw ? nyRaw.slice(0, 3) : [],
-            midiTarget: getTarget(14, 30),
-            gameAswe: "New York | ASWÈ",
-            asweBalls: nyRaw ? nyRaw.slice(3, 6) : [],
-            asweTarget: getTarget(22, 30),
-        },
-        {
-            state: "Georgia Lottery",
-            dateStr: moment(dateQuery).format("dddd, D MMM YYYY"),
-            gameMidi: "Georgia | MIDI",
-            midiBalls: gaRaw ? gaRaw.slice(0, 3) : [],
-            midiTarget: getTarget(12, 29),
-            gameAswe: "Georgia | ASWÈ",
-            asweBalls: gaRaw ? gaRaw.slice(3, 6) : [],
-            asweTarget: getTarget(23, 34),
-        }
-    ];
-
-    res.json({ items });
+    res.json({
+        items: [
+            {
+                state: "Florida Lottery",
+                dateStr: moment(dateQuery).format("dddd, D MMM YYYY"),
+                gameMidi: "Florida | MIDI",
+                midiBalls: flRaw ? flRaw.slice(0, 3) : [], // Pran 3 premye boul yo
+                midiTarget: getTarget(13, 35),
+                gameAswe: "Florida | ASWÈ",
+                asweBalls: flRaw ? flRaw.slice(3, 6) : [], // Pran 3 pwochen yo
+                asweTarget: getTarget(21, 50),
+            },
+            {
+                state: "New York Lottery",
+                dateStr: moment(dateQuery).format("dddd, D MMM YYYY"),
+                gameMidi: "New York | MIDI",
+                midiBalls: nyRaw ? nyRaw.slice(0, 3) : [],
+                midiTarget: getTarget(14, 30),
+                gameAswe: "New York | ASWÈ",
+                asweBalls: nyRaw ? nyRaw.slice(3, 6) : [],
+                asweTarget: getTarget(22, 30),
+            }
+        ]
+    });
 });
 
 app.get('/', (req, res) => res.send("Sèvè Waldorf ON - Ale sou /results"));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Sèvè a limen!"));
+app.listen(PORT, () => console.log(`Sèvè a aktif sou pòt ${PORT}`));
