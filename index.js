@@ -1,25 +1,26 @@
 const express = require('express');
+const moment = require('moment-timezone');
 const cors = require('cors');
 const app = express();
 app.use(cors());
 
 app.get('/results', (req, res) => {
-    const now = new Date();
-    const estTime = new Date(now.toLocaleString("en-US", {timeZone: "America/New_York"}));
+    // Nou fòse sèvè a travay sou lè New York (menm ak Ayiti)
+    const nyTime = moment().tz("America/New_York");
     
     const getTarget = (h, m) => {
-        let d = new Date(estTime);
-        d.setHours(h, m, 0, 0);
-        return d.toISOString();
+        let t = moment().tz("America/New_York").hours(h).minutes(m).seconds(0);
+        // Si lè a pase deja pou jodi a, nou mete l pou demen
+        if (nyTime.isAfter(t)) t.add(1, 'days');
+        return t.toISOString();
     };
 
-    // Done sa yo se egzanp pwofesyonèl (n ap rale yo sou sit la apre)
     const items = [
         {
             state: "Florida Lottery",
-            dateStr: "Samdi, 27 Desanm 2025",
+            dateStr: nyTime.format("dddd, D MMM YYYY"),
             gameMidi: "Florida | MIDI",
-            midiBalls: ["04", "52", "00", "01"],
+            midiBalls: ["04", "52", "00", "01"], // Isit la ou ka mete rezilta reyèl yo
             midiTarget: getTarget(13, 35),
             gameAswe: "Florida | ASWÈ",
             asweBalls: ["03", "46", "23", "66"],
@@ -27,7 +28,7 @@ app.get('/results', (req, res) => {
         },
         {
             state: "New York Lottery",
-            dateStr: "Samdi, 27 Desanm 2025",
+            dateStr: nyTime.format("dddd, D MMM YYYY"),
             gameMidi: "New York | MIDI",
             midiBalls: ["04", "64", "45", "73"],
             midiTarget: getTarget(14, 30),
@@ -39,5 +40,4 @@ app.get('/results', (req, res) => {
     res.json({ items });
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Sèvè Pro Online!'));
+app.listen(process.env.PORT || 3000);
