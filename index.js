@@ -1,5 +1,4 @@
 // index.js — Lottery API Server (NO scraping) using Magayo
-
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
@@ -11,15 +10,17 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// ✅ API KEY la anndan kòd la (tanporè)
-const MAGAYO_API_KEY = "LdmqpX6izpWSXLtSe8";
+// ✅ Mete key ou la (tanporè). Pi bon se Env Var pita.
+const MAGAYO_API_KEY = "PASTE_YOUR_MAGAYO_KEY_HERE";
 
 const MAGAYO_RESULTS_URL = "https://www.magayo.com/api/results.php";
 const TZ = "America/New_York";
 
-// Cache 60 sec
-let CACHE = { ts: 0, data: null };
-const CACHE_MS = 60 * 1000;
+// ✅ Cache 30 min
+const CACHE_MS = 30 * 60 * 1000;
+
+// Cache pou tout eta yo (all) + pou chak state separe
+const CACHE = new Map(); // key: "all" | "fl" | "ny" | "ga" -> {ts, payload}
 
 function nextTargetISO(hour, minute) {
   const now = moment.tz(TZ);
@@ -29,40 +30,51 @@ function nextTargetISO(hour, minute) {
 }
 
 function toDateStr(draw) {
-  if (!draw) return "";
+  if (!draw) return "-";
   const m = moment.tz(draw, "YYYY-MM-DD", TZ);
   return m.isValid() ? m.format("dddd, DD MMM YYYY") : String(draw);
 }
 
+// ✅ Parse solid: si Magayo voye "452 0" oswa "452-0", nou pran premye 3 chif yo
 function parseBalls(results, digits = 3) {
   if (!results || typeof results !== "string") return [];
   const first = results.split(";")[0].trim();
-
-  if (first.includes(",")) {
-    return first.split(",").map((s) => s.trim()).filter(Boolean);
-  }
-
   const onlyDigits = first.replace(/\D/g, "");
-  if (digits && onlyDigits.length === digits) return onlyDigits.split("");
 
-  return onlyDigits ? [onlyDigits] : [];
+  if (onlyDigits.length >= digits) {
+    return onlyDigits.slice(0, digits).split("");
+  }
+  return [];
 }
 
-// ✅ FIX: pa gen includes() ankò — sa t ap bloke tout bagay
+// Normalize state query: fl/ny/ga, florida/newyork/georgia, etc.
+function normState(q) {
+  const s = String(q || "").toLowerCase().trim();
+  if (!s) return "";
+  if (["fl", "florida", "floridelottery", "florida lottery"].includes(s)) return "fl";
+  if (["ny", "newyork", "new york", "new york lottery"].includes(s)) return "ny";
+  if (["ga", "georgia", "georgia lottery"].includes(s)) return "ga";
+  return s; // fallback
+}
+
 async function magayo(game) {
-  if (!MAGAYO_API_KEY) {
-    throw new Error("MAGAYO API key la vid nan index.js.");
+  if (!MAGAYO_API_KEY || MAGAYO_API_KEY.includes("PASTE_YOUR_MAGAYO_KEY_HERE")) {
+    throw new Error("Mete MAGAYO API key la nan index.js.");
   }
 
   const res = await axios.get(MAGAYO_RESULTS_URL, {
     params: { api_key: MAGAYO_API_KEY, game },
     timeout: 15000,
     headers: { Accept: "application/json" },
+    validateStatus: () => true,
   });
 
+  // Magayo retounen JSON; pafwa li ka retounen HTML si gen pwoblèm
   const data = res.data || {};
+  const err = Number(data.error ?? 999);
+
   return {
-    error: Number(data.error ?? 999),
+    error: err,
     message: data.message ?? data.msg ?? "",
     draw: data.draw ?? "",
     results: data.results ?? "",
@@ -70,29 +82,31 @@ async function magayo(game) {
   };
 }
 
-// ✅ Konfig jwèt yo (FL / NY / GA)
+// ✅ Konfig jwèt yo (FL/NY/GA) + code pou query param
 const CONFIG = [
   {
-    state: "Florida Lottery",
-    midi: { label: "Pick 3 Midday", game: "us_fl_cash3_mid", time: { hour: 13, minute: 30 }, digits: 3 },
-    aswe: { label: "Pick 3 Evening", game: "us_fl_cash3_eve", time: { hour: 21, minute: 45 }, digits: 3 },
+    code: "fl",
+    state: "Loterie de Floride",
+    midi: { label: "Pick 3 Midi", game: "us_fl_cash3_mid", time: { hour: 13, minute: 30 }, digits: 3 },
+    aswe: { label: "Pick 3 Soir", game: "us_fl_cash3_eve", time: { hour: 21, minute: 45 }, digits: 3 },
   },
   {
-    state: "New York Lottery",
-    midi: { label: "Numbers Midday", game: "us_ny_numbers_mid", time: { hour: 14, minute: 30 }, digits: 3 },
-    aswe: { label: "Numbers Evening", game: "us_ny_numbers_eve", time: { hour: 22, minute: 30 }, digits: 3 },
+    code: "ny",
+    state: "Loterie de New York",
+    midi: { label: "Numbers Midi", game: "us_ny_numbers_mid", time: { hour: 14, minute: 30 }, digits: 3 },
+    aswe: { label: "Numbers Soir", game: "us_ny_numbers_eve", time: { hour: 22, minute: 30 }, digits: 3 },
   },
   {
-    state: "Georgia Lottery",
-    midi: { label: "Cash 3 Midday", game: "us_ga_cash3_mid", time: { hour: 12, minute: 29 }, digits: 3 },
-    aswe: { label: "Cash 3 Night", game: "us_ga_cash3_night", time: { hour: 23, minute: 34 }, digits: 3 },
-    // Si ou pito Evening:
-    // aswe: { label: "Cash 3 Evening", game: "us_ga_cash3_eve", time: { hour: 18, minute: 34 }, digits: 3 }
+    code: "ga",
+    state: "Loterie de Géorgie",
+    midi: { label: "Cash 3 Midi", game: "us_ga_cash3_mid", time: { hour: 12, minute: 29 }, digits: 3 },
+    aswe: { label: "Cash 3 Nuit", game: "us_ga_cash3_night", time: { hour: 23, minute: 34 }, digits: 3 },
   },
 ];
 
 async function buildItem(cfg) {
   const [m1, m2] = await Promise.all([magayo(cfg.midi.game), magayo(cfg.aswe.game)]);
+
   const dateStr = toDateStr(m1.draw || m2.draw);
 
   const midiBalls = m1.error === 0 ? parseBalls(m1.results, cfg.midi.digits) : [];
@@ -110,7 +124,6 @@ async function buildItem(cfg) {
     asweBalls,
     asweTarget: nextTargetISO(cfg.aswe.time.hour, cfg.aswe.time.minute),
 
-    // Debug: si Magayo ap voye erè, w ap wè li nan JSON la
     midiError: m1.error,
     midiMessage: m1.message,
     asweError: m2.error,
@@ -118,9 +131,20 @@ async function buildItem(cfg) {
   };
 }
 
+function getCache(key) {
+  const c = CACHE.get(key);
+  if (!c) return null;
+  const fresh = (Date.now() - c.ts) < CACHE_MS;
+  return { ...c, fresh };
+}
+
+function setCache(key, payload) {
+  CACHE.set(key, { ts: Date.now(), payload });
+}
+
 app.get("/", (req, res) => res.json({ ok: true, message: "Lottery API Server running" }));
 
-// ✅ Debug route: teste nenpòt game code
+// ✅ Debug route: teste game code dirèk
 app.get("/debug/:game", async (req, res) => {
   try {
     const game = String(req.params.game || "").trim();
@@ -130,18 +154,53 @@ app.get("/debug/:game", async (req, res) => {
   }
 });
 
+// ✅ Main route: /results?state=fl | ny | ga
 app.get("/results", async (req, res) => {
-  try {
-    const now = Date.now();
-    if (CACHE.data && now - CACHE.ts < CACHE_MS) return res.json(CACHE.data);
+  const stateQ = normState(req.query.state);
+  const cacheKey = stateQ ? stateQ : "all";
 
-    const items = await Promise.all(CONFIG.map(buildItem));
+  // 1) si cache fresh, retounen li dirèk
+  const cached = getCache(cacheKey);
+  if (cached && cached.fresh) return res.json({ ...cached.payload, stale: false });
+
+  try {
+    // 2) Rale list selon state
+    const list = stateQ
+      ? CONFIG.filter(x => x.code === stateQ)
+      : CONFIG;
+
+    if (stateQ && list.length === 0) {
+      return res.status(400).json({ error: true, message: "state pa rekonèt. Sèvi ak fl, ny, ga.", items: [] });
+    }
+
+    const items = await Promise.all(list.map(buildItem));
     const payload = { items, updatedAt: new Date().toISOString() };
 
-    CACHE = { ts: now, data: payload };
-    res.json(payload);
+    // 3) Mete cache
+    setCache(cacheKey, payload);
+
+    // 4) Si se state spesifik, mete tou nan "all" (opsyonèl)
+    if (!stateQ) setCache("all", payload);
+
+    return res.json({ ...payload, stale: false });
   } catch (e) {
-    res.status(500).json({ error: true, message: String(e?.message || e), items: [] });
+    // 5) Fallback: si gen cache (men li pa fresh), retounen li kanmèm
+    const staleCache = getCache(cacheKey);
+    if (staleCache) {
+      return res.json({
+        ...staleCache.payload,
+        stale: true,
+        warning: "Magayo limite (eg: 303) oswa erè. Mwen retounen dènye cache la.",
+      });
+    }
+
+    // Sinon pa gen anyen pou retounen
+    return res.status(500).json({
+      error: true,
+      message: String(e?.message || e),
+      items: [],
+      stale: false,
+    });
   }
 });
 
