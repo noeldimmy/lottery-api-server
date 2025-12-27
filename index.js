@@ -1,14 +1,11 @@
-// index.js — Lottery Results API (NO scraping) using Magayo
-// Node 18+ recommended
+// index.js — Lottery Results API Server (NO scraping)
+// Source: Magayo API (results.php)
 
+require("dotenv").config();
 const express = require("express");
-const axios = require("axios");
 const cors = require("cors");
-const dotenv = require("dotenv");
-const { DateTime } = require("luxon");
-const { LRUCache } = require("lru-cache");
-
-dotenv.config();
+const axios = require("axios");
+const moment = require("moment-timezone");
 
 const app = express();
 app.use(cors());
@@ -17,176 +14,160 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const MAGAYO_API_KEY = process.env.MAGAYO_API_KEY;
 
-// Magayo endpoints (docs):
-// Results: https://www.magayo.com/api/results.php?api_key=...&game=...  (JSON by default)
-// Next draw date exists too but returns only date (no time). We'll compute time ourselves.
 const MAGAYO_RESULTS_URL = "https://www.magayo.com/api/results.php";
+const TZ = "America/New_York";
 
-// Cache to protect your Magayo quota (and speed up Flutter)
-const cache = new LRUCache({
-  max: 200,
-  ttl: 60 * 1000, // 60 seconds cache
-});
+// ---- Ti cache senp pou pa frape API a twòp (60 seg) ----
+let CACHE = { ts: 0, data: null };
+const CACHE_MS = 60 * 1000;
 
-function formatDateStr(yyyyMmDd) {
-  if (!yyyyMmDd) return "";
-  const dt = DateTime.fromISO(yyyyMmDd, { zone: "America/New_York" });
-  if (!dt.isValid) return yyyyMmDd;
-  return dt.toFormat("dd LLL yyyy"); // ex: 27 Dec 2025
+// ---- Helpers ----
+function toDateStr(drawIso) {
+  if (!drawIso) return "";
+  const m = moment.tz(drawIso, "YYYY-MM-DD", TZ);
+  return m.isValid() ? m.format("DD MMM YYYY") : String(drawIso);
 }
 
-function computeNextTargetTime({ hour, minute }, zone = "America/New_York") {
-  const now = DateTime.now().setZone(zone);
-  let t = now.set({ hour, minute, second: 0, millisecond: 0 });
-  if (now >= t) t = t.plus({ days: 1 });
-  return t.toISO(); // ISO string parseable by Flutter DateTime.parse
+function nextTargetISO(hour, minute) {
+  const now = moment.tz(TZ);
+  let t = moment.tz(TZ).set({ hour, minute, second: 0, millisecond: 0 });
+  if (now.isSameOrAfter(t)) t = t.add(1, "day");
+  return t.toDate().toISOString(); // Flutter DateTime.parse() ap li li byen
 }
 
-// Parse Magayo "results" for Pick3/Numbers style (ex: "434" or "4,3,4" depending on game)
-// - If comma-separated => ["4","3","4"]
-// - If plain digits and expectedDigits provided => split digits
-function parseBalls(results, expectedDigits) {
+// Parse "results" Magayo a -> balls[]
+// Egzanp: "4,3,4" -> ["4","3","4"]
+// Egzanp: "434" -> ["4","3","4"]
+function parseBalls(results, digits = 3) {
   if (!results || typeof results !== "string") return [];
 
-  const r = results.trim();
+  // Si gen plizyè rezilta separe (depann jwèt), pran premye a
+  const first = results.split(";")[0].trim();
 
-  // If multiple prizes returned like "2388,7878,6892", take first (top prize) for UI
-  // (Magayo docs mention Pick games may return multiple prizes in results) :contentReference[oaicite:7]{index=7}
-  const top = r.split(";")[0].trim();
-
-  if (top.includes(",")) {
-    return top
+  // Si gen vigil
+  if (first.includes(",")) {
+    return first
       .split(",")
       .map((x) => x.trim())
       .filter(Boolean);
   }
 
-  const digitsOnly = top.replace(/\D/g, "");
+  // Si se chif kole
+  const onlyDigits = first.replace(/\D/g, "");
+  if (onlyDigits.length === digits) return onlyDigits.split("");
 
-  if (expectedDigits && digitsOnly.length === expectedDigits) {
-    return digitsOnly.split("");
-  }
-
-  // fallback: return whole string as one "ball"
-  return digitsOnly ? [digitsOnly] : [];
+  return onlyDigits ? [onlyDigits] : [];
 }
 
-async function magayoGetLatest(gameCode) {
-  const key = `magayo:${gameCode}`;
-  const cached = cache.get(key);
-  if (cached) return cached;
-
-  if (!MAGAYO_API_KEY) {
-    throw new Error("MAGAYO_API_KEY missing in env vars.");
-  }
+async function getLatestResult(gameCode) {
+  if (!MAGAYO_API_KEY) throw new Error("MAGAYO_API_KEY pa mete nan Env Vars sou Render.");
 
   const res = await axios.get(MAGAYO_RESULTS_URL, {
-    params: {
-      api_key: MAGAYO_API_KEY,
-      game: gameCode,
-      // format json default
-    },
+    params: { api_key: MAGAYO_API_KEY, game: gameCode },
     timeout: 12000,
-    headers: {
-      "Accept": "application/json",
-    },
+    headers: { Accept: "application/json" },
   });
 
-  const data = res.data || {};
-  // Typical response includes: { error: 0, draw: "YYYY-MM-DD", results: "..." } :contentReference[oaicite:8]{index=8}
-  cache.set(key, data);
-  return data;
+  // Magayo souvan retounen: { error:0, draw:"YYYY-MM-DD", results:"..." }
+  return res.data;
 }
 
-const STATES = [
+// ---- Konfig jwèt ou vle yo (midi + aswè) ----
+const CONFIG = [
   {
-    state: "Florida",
+    state: "Florida Lottery",
     midi: {
       label: "Pick 3 Midday",
       game: "us_fl_cash3_mid",
-      time: { hour: 13, minute: 30 }, // 1:30 PM ET :contentReference[oaicite:9]{index=9}
+      time: { hour: 13, minute: 30 },
       digits: 3,
     },
     aswe: {
       label: "Pick 3 Evening",
       game: "us_fl_cash3_eve",
-      time: { hour: 21, minute: 45 }, // 9:45 PM ET :contentReference[oaicite:10]{index=10}
+      time: { hour: 21, minute: 45 },
       digits: 3,
     },
   },
   {
-    state: "New York",
+    state: "New York Lottery",
     midi: {
       label: "Numbers Midday",
       game: "us_ny_numbers_mid",
-      time: { hour: 14, minute: 30 }, // 2:30 PM ET :contentReference[oaicite:11]{index=11}
+      time: { hour: 14, minute: 30 },
       digits: 3,
     },
     aswe: {
       label: "Numbers Evening",
       game: "us_ny_numbers_eve",
-      time: { hour: 22, minute: 30 }, // 10:30 PM ET :contentReference[oaicite:12]{index=12}
+      time: { hour: 22, minute: 30 },
       digits: 3,
     },
   },
   {
-    state: "Georgia",
+    state: "Georgia Lottery",
     midi: {
       label: "Cash 3 Midday",
       game: "us_ga_cash3_mid",
-      time: { hour: 12, minute: 29 }, // 12:29 PM ET :contentReference[oaicite:13]{index=13}
+      time: { hour: 12, minute: 29 },
       digits: 3,
     },
-    // App ou a gen 2 blòk (midi + aswè). Georgia gen 3 tiraj (midi/evening/night),
-    // mwen mete "Night" kòm aswè pou w gen dènye tiraj la.
+    // Si ou pito "Night" olye "Evening", chanje game + time:
+    // game: "us_ga_cash3_night", time: { hour: 23, minute: 34 }
     aswe: {
-      label: "Cash 3 Night",
-      game: "us_ga_cash3_night",
-      time: { hour: 23, minute: 34 }, // 11:34 PM ET :contentReference[oaicite:14]{index=14}
+      label: "Cash 3 Evening",
+      game: "us_ga_cash3_eve",
+      time: { hour: 18, minute: 34 },
       digits: 3,
     },
   },
 ];
 
-async function buildStateItem(cfg) {
-  const [midiData, asweData] = await Promise.allSettled([
-    magayoGetLatest(cfg.midi.game),
-    magayoGetLatest(cfg.aswe.game),
+async function buildItem(cfg) {
+  const [midiRes, asweRes] = await Promise.allSettled([
+    getLatestResult(cfg.midi.game),
+    getLatestResult(cfg.aswe.game),
   ]);
 
-  const midiOk = midiData.status === "fulfilled" ? midiData.value : null;
-  const asweOk = asweData.status === "fulfilled" ? asweData.value : null;
+  const midiData = midiRes.status === "fulfilled" ? midiRes.value : null;
+  const asweData = asweRes.status === "fulfilled" ? asweRes.value : null;
 
-  const dateStr = formatDateStr(midiOk?.draw || asweOk?.draw || DateTime.now().toISODate());
+  const draw = (midiData && midiData.draw) || (asweData && asweData.draw) || "";
+  const dateStr = toDateStr(draw);
 
-  const midiBalls = midiOk?.error === 0 ? parseBalls(midiOk.results, cfg.midi.digits) : [];
-  const asweBalls = asweOk?.error === 0 ? parseBalls(asweOk.results, cfg.aswe.digits) : [];
+  const midiBalls =
+    midiData && midiData.error === 0 ? parseBalls(midiData.results, cfg.midi.digits) : [];
+  const asweBalls =
+    asweData && asweData.error === 0 ? parseBalls(asweData.results, cfg.aswe.digits) : [];
 
   return {
     state: cfg.state,
     dateStr,
     gameMidi: cfg.midi.label,
     midiBalls,
-    midiTarget: computeNextTargetTime(cfg.midi.time),
+    midiTarget: nextTargetISO(cfg.midi.time.hour, cfg.midi.time.minute),
     gameAswe: cfg.aswe.label,
     asweBalls,
-    asweTarget: computeNextTargetTime(cfg.aswe.time),
+    asweTarget: nextTargetISO(cfg.aswe.time.hour, cfg.aswe.time.minute),
   };
 }
 
+// ---- Routes ----
 app.get("/", (req, res) => {
-  res.json({ ok: true, message: "Lottery API Server running" });
+  res.json({ ok: true, message: "Lottery API Server (Magayo) running." });
 });
 
 app.get("/results", async (req, res) => {
   try {
-    const cacheKey = "results:all";
-    const cached = cache.get(cacheKey);
-    if (cached) return res.json(cached);
+    const now = Date.now();
+    if (CACHE.data && now - CACHE.ts < CACHE_MS) {
+      return res.json(CACHE.data);
+    }
 
-    const items = await Promise.all(STATES.map(buildStateItem));
-    const payload = { items };
-    cache.set(cacheKey, payload);
+    const items = await Promise.all(CONFIG.map(buildItem));
+    const payload = { items, updatedAt: new Date().toISOString() };
+
+    CACHE = { ts: now, data: payload };
     res.json(payload);
   } catch (err) {
     res.status(500).json({
@@ -197,6 +178,4 @@ app.get("/results", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
