@@ -11,7 +11,7 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 
 // ✅ Mete key ou la (tanporè). Pi bon se Env Var pita.
-const MAGAYO_API_KEY = "PASTE_YOUR_MAGAYO_KEY_HERE";
+const MAGAYO_API_KEY = "LdmqpX6izpWSXLtSe8";
 
 const MAGAYO_RESULTS_URL = "https://www.magayo.com/api/results.php";
 const TZ = "America/New_York";
@@ -205,3 +205,4 @@ app.get("/results", async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+
