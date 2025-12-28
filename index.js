@@ -1,27 +1,25 @@
-// index.js — Lottery API Server (NO scraping) using Magayo
+// index.js — Lottery API Server (NO Magayo, NO scraping agressif)
+// Florida: parse official PDF Pick 3 history
+// NY + GA: placeholders to plug in official PDF URLs (same technique)
+
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
 const moment = require("moment-timezone");
+const pdfParse = require("pdf-parse");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-
-// ✅ Mete key ou la (tanporè). Pi bon se Env Var pita.
-const MAGAYO_API_KEY = "LdmqpX6izpWSXLtSe8";
-
-const MAGAYO_RESULTS_URL = "https://www.magayo.com/api/results.php";
 const TZ = "America/New_York";
 
-// ✅ Cache 30 min
-const CACHE_MS = 30 * 60 * 1000;
+// ------------------ CACHE ------------------
+let CACHE = { ts: 0, data: null };
+const CACHE_MS = 3 * 60 * 1000; // 3 min cache (PDF pi lou)
 
-// Cache pou tout eta yo (all) + pou chak state separe
-const CACHE = new Map(); // key: "all" | "fl" | "ny" | "ga" -> {ts, payload}
-
+// ------------------ HELPERS ------------------
 function nextTargetISO(hour, minute) {
   const now = moment.tz(TZ);
   let t = moment.tz(TZ).set({ hour, minute, second: 0, millisecond: 0 });
@@ -29,180 +27,220 @@ function nextTargetISO(hour, minute) {
   return t.toDate().toISOString();
 }
 
-function toDateStr(draw) {
-  if (!draw) return "-";
-  const m = moment.tz(draw, "YYYY-MM-DD", TZ);
-  return m.isValid() ? m.format("dddd, DD MMM YYYY") : String(draw);
+function formatDateStr(dateISO) {
+  if (!dateISO) return "-";
+  return moment.tz(dateISO, TZ).format("dddd, DD MMM YYYY");
 }
 
-// ✅ Parse solid: si Magayo voye "452 0" oswa "452-0", nou pran premye 3 chif yo
-function parseBalls(results, digits = 3) {
-  if (!results || typeof results !== "string") return [];
-  const first = results.split(";")[0].trim();
-  const onlyDigits = first.replace(/\D/g, "");
+function splitDigits(numStr) {
+  const s = String(numStr || "").replace(/\D/g, "");
+  if (!s) return [];
+  return s.split("");
+}
 
-  if (onlyDigits.length >= digits) {
-    return onlyDigits.slice(0, digits).split("");
+// ------------------ FLORIDA (PDF) ------------------
+// Official Pick 3 winning history PDF (contains lines like: 12/26/25 M 9-4-5 FB0)
+const FL_PICK3_PDF = "https://files.floridalottery.com/exptkt/p3.pdf";
+
+async function fetchPdfText(url) {
+  const res = await axios.get(url, { responseType: "arraybuffer", timeout: 20000 });
+  const data = await pdfParse(res.data);
+  return data.text || "";
+}
+
+function parseFloridaPick3FromText(pdfText) {
+  // Example text pattern:
+  // 12/26/25 M 9-4-5 FB0
+  // 12/26/25 E 3-4-6 FB0
+  const re = /(\d{2}\/\d{2}\/\d{2})\s+([ME])\s+(\d)\s*-\s*(\d)\s*-\s*(\d)\s+FB\s*([0-9])/g;
+
+  const rows = [];
+  let m;
+  while ((m = re.exec(pdfText)) !== null) {
+    const [_, mmddyy, drawME, d1, d2, d3, fb] = m;
+    const dt = moment.tz(mmddyy, "MM/DD/YY", TZ);
+    rows.push({
+      dateKey: dt.format("YYYY-MM-DD"),
+      dateStr: dt.format("dddd, DD MMM YYYY"),
+      draw: drawME === "M" ? "MIDI" : "ASWÈ",
+      number: `${d1}${d2}${d3}`,
+      fireball: String(fb)
+    });
   }
-  return [];
+
+  if (!rows.length) return null;
+
+  // pran dènye dat ki pi resan
+  rows.sort((a, b) => (a.dateKey < b.dateKey ? 1 : -1));
+  const latestDate = rows[0].dateKey;
+  const dayRows = rows.filter(r => r.dateKey === latestDate);
+
+  const midi = dayRows.find(r => r.draw === "MIDI") || null;
+  const aswe = dayRows.find(r => r.draw === "ASWÈ") || null;
+
+  return { latestDate, dateStr: dayRows[0]?.dateStr || "-", midi, aswe };
 }
 
-// Normalize state query: fl/ny/ga, florida/newyork/georgia, etc.
-function normState(q) {
-  const s = String(q || "").toLowerCase().trim();
-  if (!s) return "";
-  if (["fl", "florida", "floridelottery", "florida lottery"].includes(s)) return "fl";
-  if (["ny", "newyork", "new york", "new york lottery"].includes(s)) return "ny";
-  if (["ga", "georgia", "georgia lottery"].includes(s)) return "ga";
-  return s; // fallback
-}
+async function buildFloridaItem() {
+  const pdfText = await fetchPdfText(FL_PICK3_PDF);
+  const parsed = parseFloridaPick3FromText(pdfText);
 
-async function magayo(game) {
-  if (!MAGAYO_API_KEY || MAGAYO_API_KEY.includes("PASTE_YOUR_MAGAYO_KEY_HERE")) {
-    throw new Error("Mete MAGAYO API key la nan index.js.");
+  // Florida Pick 3 times: Midday ~ 1:30 PM, Evening ~ 9:45 PM (ET)
+  const midiTarget = nextTargetISO(13, 30);
+  const asweTarget = nextTargetISO(21, 45);
+
+  if (!parsed) {
+    return {
+      state: "Loterie de Floride",
+      dateStr: "-",
+      gameMidi: "Pick 3 Midi",
+      midiBalls: [],
+      midiTarget,
+      gameAswe: "Pick 3 Soir",
+      asweBalls: [],
+      asweTarget,
+      midiError: 1,
+      midiMessage: "Pa jwenn done Florida nan PDF la.",
+      asweError: 1,
+      asweMessage: "Pa jwenn done Florida nan PDF la."
+    };
   }
-
-  const res = await axios.get(MAGAYO_RESULTS_URL, {
-    params: { api_key: MAGAYO_API_KEY, game },
-    timeout: 15000,
-    headers: { Accept: "application/json" },
-    validateStatus: () => true,
-  });
-
-  // Magayo retounen JSON; pafwa li ka retounen HTML si gen pwoblèm
-  const data = res.data || {};
-  const err = Number(data.error ?? 999);
 
   return {
-    error: err,
-    message: data.message ?? data.msg ?? "",
-    draw: data.draw ?? "",
-    results: data.results ?? "",
-    raw: data,
-  };
-}
-
-// ✅ Konfig jwèt yo (FL/NY/GA) + code pou query param
-const CONFIG = [
-  {
-    code: "fl",
     state: "Loterie de Floride",
-    midi: { label: "Pick 3 Midi", game: "us_fl_cash3_mid", time: { hour: 13, minute: 30 }, digits: 3 },
-    aswe: { label: "Pick 3 Soir", game: "us_fl_cash3_eve", time: { hour: 21, minute: 45 }, digits: 3 },
-  },
-  {
-    code: "ny",
-    state: "Loterie de New York",
-    midi: { label: "Numbers Midi", game: "us_ny_numbers_mid", time: { hour: 14, minute: 30 }, digits: 3 },
-    aswe: { label: "Numbers Soir", game: "us_ny_numbers_eve", time: { hour: 22, minute: 30 }, digits: 3 },
-  },
-  {
-    code: "ga",
-    state: "Loterie de Géorgie",
-    midi: { label: "Cash 3 Midi", game: "us_ga_cash3_mid", time: { hour: 12, minute: 29 }, digits: 3 },
-    aswe: { label: "Cash 3 Nuit", game: "us_ga_cash3_night", time: { hour: 23, minute: 34 }, digits: 3 },
-  },
-];
+    dateStr: parsed.dateStr || "-",
 
-async function buildItem(cfg) {
-  const [m1, m2] = await Promise.all([magayo(cfg.midi.game), magayo(cfg.aswe.game)]);
+    gameMidi: "Pick 3 Midi",
+    midiBalls: parsed.midi ? splitDigits(parsed.midi.number) : [],
+    midiTarget,
 
-  const dateStr = toDateStr(m1.draw || m2.draw);
+    gameAswe: "Pick 3 Soir",
+    asweBalls: parsed.aswe ? splitDigits(parsed.aswe.number) : [],
+    asweTarget,
 
-  const midiBalls = m1.error === 0 ? parseBalls(m1.results, cfg.midi.digits) : [];
-  const asweBalls = m2.error === 0 ? parseBalls(m2.results, cfg.aswe.digits) : [];
-
-  return {
-    state: cfg.state,
-    dateStr,
-
-    gameMidi: cfg.midi.label,
-    midiBalls,
-    midiTarget: nextTargetISO(cfg.midi.time.hour, cfg.midi.time.minute),
-
-    gameAswe: cfg.aswe.label,
-    asweBalls,
-    asweTarget: nextTargetISO(cfg.aswe.time.hour, cfg.aswe.time.minute),
-
-    midiError: m1.error,
-    midiMessage: m1.message,
-    asweError: m2.error,
-    asweMessage: m2.message,
+    midiError: 0,
+    midiMessage: parsed.midi ? "" : "Pa jwenn MIDI pou dènye dat la.",
+    asweError: 0,
+    asweMessage: parsed.aswe ? "" : "Pa jwenn ASWÈ pou dènye dat la."
   };
 }
 
-function getCache(key) {
-  const c = CACHE.get(key);
-  if (!c) return null;
-  const fresh = (Date.now() - c.ts) < CACHE_MS;
-  return { ...c, fresh };
+// ------------------ NY + GA (PLUG IN PDF URLs) ------------------
+// Pou NY/GA: pi bon pratik la se itilize “Winning numbers history” PDF ofisyèl yo tou.
+// Ou mete URL PDF la isit la, epi nou itilize menm teknik parse PDF la (regex diferan selon fòma).
+const NY_NUMBERS_PDF = ""; // <-- mete URL PDF ofisyèl la lè ou genyen l
+const GA_CASH3_PDF = "";   // <-- mete URL PDF ofisyèl la lè ou genyen l
+
+async function buildNYItem() {
+  // NY Numbers times: Midday 2:30 PM, Evening 10:30 PM 
+  const midiTarget = nextTargetISO(14, 30);
+  const asweTarget = nextTargetISO(22, 30);
+
+  if (!NY_NUMBERS_PDF) {
+    return {
+      state: "Loterie de New York",
+      dateStr: "-",
+      gameMidi: "Numbers Midi",
+      midiBalls: [],
+      midiTarget,
+      gameAswe: "Numbers Soir",
+      asweBalls: [],
+      asweTarget,
+      midiError: 2,
+      midiMessage: "NY PDF URL poko mete. Mete NY_NUMBERS_PDF nan index.js.",
+      asweError: 2,
+      asweMessage: "NY PDF URL poko mete. Mete NY_NUMBERS_PDF nan index.js."
+    };
+  }
+
+  // Lè ou mete PDF la, n ap ajoute regex pou NY.
+  return {
+    state: "Loterie de New York",
+    dateStr: "-",
+    gameMidi: "Numbers Midi",
+    midiBalls: [],
+    midiTarget,
+    gameAswe: "Numbers Soir",
+    asweBalls: [],
+    asweTarget,
+    midiError: 3,
+    midiMessage: "NY parse poko aktive (fòma PDF la bezwen regex).",
+    asweError: 3,
+    asweMessage: "NY parse poko aktive (fòma PDF la bezwen regex)."
+  };
 }
 
-function setCache(key, payload) {
-  CACHE.set(key, { ts: Date.now(), payload });
+async function buildGAItem() {
+  // GA Cash 3 times: 12:29 pm, 6:59 pm, 11:34 pm 
+  // Nan app ou: nou kenbe MIDI (12:29) + ASWÈ/NIGHT (11:34)
+  const midiTarget = nextTargetISO(12, 29);
+  const asweTarget = nextTargetISO(23, 34);
+
+  if (!GA_CASH3_PDF) {
+    return {
+      state: "Loterie de Géorgie",
+      dateStr: "-",
+      gameMidi: "Cash 3 Midi",
+      midiBalls: [],
+      midiTarget,
+      gameAswe: "Cash 3 Nuit",
+      asweBalls: [],
+      asweTarget,
+      midiError: 2,
+      midiMessage: "GA PDF URL poko mete. Mete GA_CASH3_PDF nan index.js.",
+      asweError: 2,
+      asweMessage: "GA PDF URL poko mete. Mete GA_CASH3_PDF nan index.js."
+    };
+  }
+
+  // Lè ou mete PDF la, n ap ajoute regex pou GA.
+  return {
+    state: "Loterie de Géorgie",
+    dateStr: "-",
+    gameMidi: "Cash 3 Midi",
+    midiBalls: [],
+    midiTarget,
+    gameAswe: "Cash 3 Nuit",
+    asweBalls: [],
+    asweTarget,
+    midiError: 3,
+    midiMessage: "GA parse poko aktive (fòma PDF la bezwen regex).",
+    asweError: 3,
+    asweMessage: "GA parse poko aktive (fòma PDF la bezwen regex)."
+  };
 }
 
+// ------------------ ROUTES ------------------
 app.get("/", (req, res) => res.json({ ok: true, message: "Lottery API Server running" }));
 
-// ✅ Debug route: teste game code dirèk
-app.get("/debug/:game", async (req, res) => {
-  try {
-    const game = String(req.params.game || "").trim();
-    res.json(await magayo(game));
-  } catch (e) {
-    res.status(500).json({ error: true, message: String(e?.message || e) });
-  }
-});
-
-// ✅ Main route: /results?state=fl | ny | ga
 app.get("/results", async (req, res) => {
-  const stateQ = normState(req.query.state);
-  const cacheKey = stateQ ? stateQ : "all";
-
-  // 1) si cache fresh, retounen li dirèk
-  const cached = getCache(cacheKey);
-  if (cached && cached.fresh) return res.json({ ...cached.payload, stale: false });
-
   try {
-    // 2) Rale list selon state
-    const list = stateQ
-      ? CONFIG.filter(x => x.code === stateQ)
-      : CONFIG;
+    const now = Date.now();
+    if (CACHE.data && (now - CACHE.ts) < CACHE_MS) return res.json(CACHE.data);
 
-    if (stateQ && list.length === 0) {
-      return res.status(400).json({ error: true, message: "state pa rekonèt. Sèvi ak fl, ny, ga.", items: [] });
-    }
+    const [fl, ny, ga] = await Promise.all([
+      buildFloridaItem(),
+      buildNYItem(),
+      buildGAItem()
+    ]);
 
-    const items = await Promise.all(list.map(buildItem));
-    const payload = { items, updatedAt: new Date().toISOString() };
+    const payload = {
+      items: [fl, ny, ga],
+      updatedAt: new Date().toISOString(),
+      stale: false
+    };
 
-    // 3) Mete cache
-    setCache(cacheKey, payload);
-
-    // 4) Si se state spesifik, mete tou nan "all" (opsyonèl)
-    if (!stateQ) setCache("all", payload);
-
-    return res.json({ ...payload, stale: false });
+    CACHE = { ts: now, data: payload };
+    res.json(payload);
   } catch (e) {
-    // 5) Fallback: si gen cache (men li pa fresh), retounen li kanmèm
-    const staleCache = getCache(cacheKey);
-    if (staleCache) {
-      return res.json({
-        ...staleCache.payload,
-        stale: true,
-        warning: "Magayo limite (eg: 303) oswa erè. Mwen retounen dènye cache la.",
-      });
-    }
-
-    // Sinon pa gen anyen pou retounen
-    return res.status(500).json({
+    res.status(500).json({
       error: true,
       message: String(e?.message || e),
       items: [],
-      stale: false,
+      updatedAt: new Date().toISOString(),
+      stale: true
     });
   }
 });
 
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
-
