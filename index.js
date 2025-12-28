@@ -5,6 +5,8 @@ const axios = require("axios");
 const cheerio = require("cheerio");
 const moment = require("moment-timezone");
 const pdfParse = require("pdf-parse");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 app.use(cors());
@@ -58,6 +60,7 @@ function nextTargetISO(hour, minute) {
 // ---------- Caching (stale-while-revalidate) ----------
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 min
 const REFRESH_INTERVAL_MS = 5 * 60 * 1000; // 5 min
+const CACHE_PATH = process.env.CACHE_PATH || path.join(__dirname, "cache.json");
 
 const CACHE = {
   ts: 0,
@@ -65,6 +68,29 @@ const CACHE = {
   lastGood: null,
   inFlight: false
 };
+
+async function loadCacheFromDisk() {
+  try {
+    const raw = await fs.promises.readFile(CACHE_PATH, "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed?.items?.length) {
+      CACHE.lastGood = parsed;
+      CACHE.data = { ...parsed, stale: true };
+      CACHE.ts = Date.now();
+      logEvent("info", "CACHE_BOOTSTRAP", { items: parsed.items.length });
+    }
+  } catch (err) {
+    logEvent("info", "CACHE_BOOTSTRAP_SKIP", { message: err?.message });
+  }
+}
+
+async function saveCacheToDisk(payload) {
+  try {
+    await fs.promises.writeFile(CACHE_PATH, JSON.stringify(payload, null, 2));
+  } catch (err) {
+    logEvent("error", "CACHE_WRITE_FAILED", { message: err?.message });
+  }
+}
 
 async function safeFetch(url, options = {}) {
   try {
@@ -88,6 +114,15 @@ function errorResult(message, code = "PARSE_ERROR") {
     asweBalls: [],
     source: ""
   };
+}
+
+async function fetchWithFallback(label, fns) {
+  for (const fn of fns) {
+    const result = await fn();
+    if (result.ok) return result;
+    logEvent("warn", "FETCH_FALLBACK", { state: label, message: result.message });
+  }
+  return errorResult(`${label}: tout sous yo echwe.`, "FETCH_HTTP");
 }
 
 // ---------- NEW YORK (OFFICIAL PAGE) ----------
@@ -122,8 +157,41 @@ async function fetchNY() {
   };
 }
 
+// ---------- FLORIDA (Fallback: LotteryPost) ----------
+async function fetchFLFromLotteryPost() {
+  const url = "https://www.lotterypost.com/results/fl/pick3/past";
+  const htmlRes = await safeFetch(url);
+  if (!htmlRes.ok) {
+    return errorResult("FL: LotteryPost pa disponib.", "FETCH_HTTP");
+  }
+
+  const text = normalizeText(cheerio.load(htmlRes.data).text());
+  const re =
+    /(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),\s+(\d{4}).*?Midday.*?(\d)\D+(\d)\D+(\d).*?Evening.*?(\d)\D+(\d)\D+(\d)/i;
+
+  const m = text.match(re);
+  if (!m) {
+    return errorResult("FL: LotteryPost pa gen modèl ki mache.");
+  }
+
+  const dateHuman = `${m[1]}, ${m[2]} ${m[3]}, ${m[4]}`;
+  const dateStr = moment.tz(dateHuman, "dddd, MMMM D, YYYY", TZ).format("dddd, DD MMMM YYYY");
+
+  return {
+    ok: true,
+    dateStr,
+    midiBalls: digits3FromMatch(m[5], m[6], m[7]),
+    asweBalls: digits3FromMatch(m[8], m[9], m[10]),
+    source: url
+  };
+}
+
 // ---------- FLORIDA (OFFICIAL PDF) ----------
 async function fetchFL() {
+  return fetchWithFallback("FL", [fetchFLFromPdf, fetchFLFromLotteryPost]);
+}
+
+async function fetchFLFromPdf() {
   const url = "https://floridalottery.com/exptkt/pick3.pdf";
   const pdfRes = await safeFetch(url, { responseType: "arraybuffer" });
   if (!pdfRes.ok) {
@@ -160,8 +228,41 @@ async function fetchFL() {
   };
 }
 
+// ---------- GEORGIA (Fallback: LotteryPost) ----------
+async function fetchGAFromLotteryPost() {
+  const url = "https://www.lotterypost.com/results/ga/cash3/past";
+  const htmlRes = await safeFetch(url);
+  if (!htmlRes.ok) {
+    return errorResult("GA: LotteryPost pa disponib.", "FETCH_HTTP");
+  }
+
+  const text = normalizeText(cheerio.load(htmlRes.data).text());
+  const re =
+    /(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),\s+(\d{4}).*?Midday.*?(\d)\D+(\d)\D+(\d).*?Night.*?(\d)\D+(\d)\D+(\d)/i;
+
+  const m = text.match(re);
+  if (!m) {
+    return errorResult("GA: LotteryPost pa gen modèl ki mache.");
+  }
+
+  const dateHuman = `${m[1]}, ${m[2]} ${m[3]}, ${m[4]}`;
+  const dateStr = moment.tz(dateHuman, "dddd, MMMM D, YYYY", TZ).format("dddd, DD MMMM YYYY");
+
+  return {
+    ok: true,
+    dateStr,
+    midiBalls: digits3FromMatch(m[5], m[6], m[7]),
+    asweBalls: digits3FromMatch(m[8], m[9], m[10]),
+    source: url
+  };
+}
+
 // ---------- GEORGIA (LOTTERYUSA) ----------
 async function fetchGA() {
+  return fetchWithFallback("GA", [fetchGAFromLotteryUsa, fetchGAFromLotteryPost]);
+}
+
+async function fetchGAFromLotteryUsa() {
   const url = "https://www.lotteryusa.com/georgia/pick-3/";
   const htmlRes = await safeFetch(url);
   if (!htmlRes.ok) {
@@ -267,6 +368,7 @@ async function refreshCache(reason) {
 
     if (!hasErrors) {
       CACHE.lastGood = CACHE.data;
+      await saveCacheToDisk(CACHE.lastGood);
     }
 
     CACHE.ts = Date.now();
@@ -290,6 +392,7 @@ async function refreshCache(reason) {
 }
 
 function startScheduler() {
+  loadCacheFromDisk();
   refreshCache("startup");
   setInterval(() => refreshCache("interval"), REFRESH_INTERVAL_MS);
 }
