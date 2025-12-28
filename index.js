@@ -1,9 +1,10 @@
-// index.js — Lottery API Server (NO Magayo) with caching + fallbacks
+// index.js — Lottery Results API (Stable: cache + auto refresh + stale fallback)
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
 const cheerio = require("cheerio");
 const moment = require("moment-timezone");
+const pdfParse = require("pdf-parse");
 
 const app = express();
 app.use(cors());
@@ -12,242 +13,355 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const TZ = "America/New_York";
 
-// ---------- AXIOS (one place) ----------
-const http = axios.create({
-  timeout: 20000,
-  headers: {
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    // Yon UA nòmal (pa “bypass”), jis pou pa sanble ak bot default
-    "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-  }
-});
+// ===== Refresh settings =====
+const REFRESH_EVERY_MS = 5 * 60 * 1000; // 5 min
+const REQUEST_TIMEOUT = 25000;
 
-function normalizeText(htmlOrText) {
-  return String(htmlOrText || "").replace(/\s+/g, " ").trim();
-}
+let STATE = {
+  payload: { items: [], updatedAt: new Date().toISOString(), stale: true },
+  lastGood: null,
+  lastError: "",
+  refreshing: false
+};
 
-function digits3FromMatch(a, b, c) {
-  return [String(a), String(b), String(c)];
-}
-
-function formatDateLong(dateISOorText) {
-  const m = moment.tz(dateISOorText, TZ);
-  return m.isValid() ? m.format("dddd, DD MMMM YYYY") : String(dateISOorText || "-");
-}
-
+// ===== Helpers =====
 function nextTargetISO(hour, minute) {
   const now = moment.tz(TZ);
   let t = moment.tz(TZ).set({ hour, minute, second: 0, millisecond: 0 });
   if (now.isSameOrAfter(t)) t = t.add(1, "day");
   return t.toDate().toISOString();
 }
-
-// ---------- Caching (important to avoid blocks) ----------
-let CACHE = { ts: 0, data: null };
-const CACHE_MS = 60 * 1000; // 60 sec
-
-async function safeFetch(url) {
-  const res = await http.get(url);
-  return res.data;
+function fmtLongDate(dateLike) {
+  if (!dateLike) return "-";
+  const m = moment.tz(dateLike, ["YYYY-MM-DD", "MM/DD/YY", "MM/DD/YYYY"], TZ);
+  return m.isValid() ? m.format("dddd, D MMMM YYYY") : String(dateLike);
+}
+function digits3Array(s) {
+  const d = String(s || "").replace(/\D/g, "");
+  return d.length === 3 ? d.split("") : [];
+}
+async function httpGet(url, opts = {}) {
+  const res = await axios.get(url, {
+    timeout: REQUEST_TIMEOUT,
+    headers: {
+      "Accept": opts.accept || "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9"
+    },
+    responseType: opts.responseType || "text",
+    validateStatus: (s) => s >= 200 && s < 400
+  });
+  return res;
 }
 
-// ---------- NEW YORK (OFFICIAL PAGE) ----------
-async function fetchNY() {
-  const url = "https://www.nylottery.org/numbers/past-winning-numbers";
-  const html = await safeFetch(url);
-  const text = normalizeText(cheerio.load(html).text());
+// ===== Sources =====
+// Florida official PDF Pick 3
+const FL_PICK3_PDF = "https://files.floridalottery.com/exptkt/p3.pdf"; // official 
+// New York official numbers page
+const NY_NUMBERS_URL = "https://www.nylottery.org/numbers/past-winning-numbers"; // 
+// Georgia (can 403 on datacenter IP). We'll stale fallback if blocked.
+const GA_CASH3_URL = "https://www.lotterypost.com/results/ga/cash3/past"; // may 403 
 
-  // Egzanp (sou paj la):
-  // "Saturday December 27th 2025 Midday: 8 9 3 Evening: 0 5 0"
+// ===== Florida parser (PDF) =====
+function parseFloridaPick3PdfText(text) {
+  const t = String(text || "").replace(/\s+/g, " ").trim();
+
+  // Patterns in PDF often include:
+  // 12/26/25 M 3 9 3
+  // 12/26/25 E 1 1 4
+  const reSpaced = /(\d{2}\/\d{2}\/\d{2})\s+([ME])\s+(\d)\s+(\d)\s+(\d)/g;
+  const reCompact = /(\d{2}\/\d{2}\/\d{2})\s+([ME])\s+(\d{3})/g;
+
+  const map = new Map(); // date -> { M:"393", E:"114" }
+  let m;
+
+  while ((m = reSpaced.exec(t)) !== null) {
+    const date = m[1];
+    const draw = m[2];
+    const num = `${m[3]}${m[4]}${m[5]}`;
+    if (!map.has(date)) map.set(date, {});
+    map.get(date)[draw] = num;
+  }
+
+  while ((m = reCompact.exec(t)) !== null) {
+    const date = m[1];
+    const draw = m[2];
+    const num = m[3];
+    if (!map.has(date)) map.set(date, {});
+    if (!map.get(date)[draw]) map.get(date)[draw] = num;
+  }
+
+  if (map.size === 0) return { ok: false, dateStr: "-", midi: [], aswe: [], message: "Florida: pa jwenn done nan PDF." };
+
+  const dates = Array.from(map.keys());
+  dates.sort((a, b) => moment(b, "MM/DD/YY").valueOf() - moment(a, "MM/DD/YY").valueOf());
+  const latest = dates[0];
+  const row = map.get(latest) || {};
+
+  const midi = digits3Array(row.M);
+  const aswe = digits3Array(row.E);
+
+  return {
+    ok: midi.length || aswe.length,
+    dateStr: fmtLongDate(latest),
+    midi,
+    aswe,
+    message: (midi.length || aswe.length) ? "" : "Florida: pa rive ekstrè 3 chif yo."
+  };
+}
+
+async function fetchFlorida() {
+  try {
+    const res = await httpGet(FL_PICK3_PDF, { responseType: "arraybuffer", accept: "application/pdf" });
+    const parsed = await pdfParse(Buffer.from(res.data));
+    const out = parseFloridaPick3PdfText(parsed.text);
+
+    return {
+      ok: out.ok,
+      dateStr: out.dateStr,
+      midiBalls: out.midi,
+      asweBalls: out.aswe,
+      error: out.ok ? 0 : 1,
+      message: out.message || "",
+      source: FL_PICK3_PDF
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      dateStr: "-",
+      midiBalls: [],
+      asweBalls: [],
+      error: 1,
+      message: String(e?.message || e),
+      source: FL_PICK3_PDF
+    };
+  }
+}
+
+// ===== New York parser (official page) =====
+function parseNYFromText(text) {
+  const t = String(text || "").replace(/\s+/g, " ").trim();
+
   const re =
     /([A-Za-z]+)\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})(?:st|nd|rd|th)?\s+(\d{4}).*?Midday:\s*(\d)\s*(\d)\s*(\d).*?Evening:\s*(\d)\s*(\d)\s*(\d)/;
 
-  const m = text.match(re);
+  const m = t.match(re);
   if (!m) {
-    return {
-      ok: false,
-      message: "NY: pa jwenn modèl Midday/Evening sou paj ofisyèl la.",
-      dateStr: "-",
-      midiBalls: [],
-      asweBalls: []
-    };
+    return { ok: false, dateStr: "-", midi: [], aswe: [], message: "NY: pa rive li Midday/Evening sou paj la." };
   }
 
-  const dateHuman = `${m[1]} ${m[2]} ${m[3]} ${m[4]}`; // ex: Saturday December 27 2025
-  const dateStr = moment.tz(dateHuman, "dddd MMMM D YYYY", TZ).format("dddd, DD MMMM YYYY");
+  const dateHuman = `${m[1]} ${m[2]} ${m[3]} ${m[4]}`;
+  const dateStr = moment.tz(dateHuman, "dddd MMMM D YYYY", TZ).format("dddd, D MMMM YYYY");
 
   return {
     ok: true,
     dateStr,
-    midiBalls: digits3FromMatch(m[5], m[6], m[7]),
-    asweBalls: digits3FromMatch(m[8], m[9], m[10]),
-    source: url
+    midi: [m[5], m[6], m[7]],
+    aswe: [m[8], m[9], m[10]],
+    message: ""
   };
 }
 
-// ---------- FLORIDA (LotteryPost - Pick 3 past) ----------
-async function fetchFL() {
-  const url = "https://www.lotterypost.com/results/fl/pick3/past";
-  const html = await safeFetch(url);
-  const text = normalizeText(cheerio.load(html).text());
+async function fetchNY() {
+  try {
+    const res = await httpGet(NY_NUMBERS_URL);
+    const $ = cheerio.load(res.data);
+    const text = $("body").text();
+    const out = parseNYFromText(text);
 
-  // Egzanp (sou paj la) montre:
-  // "Friday, December 26, 2025 Midday 9 4 5 Fireball: 7 Evening 3 4 6 Fireball: 0"
-  const re =
-    /(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),\s+(\d{4}).*?Midday.*?(\d)\D+(\d)\D+(\d).*?Evening.*?(\d)\D+(\d)\D+(\d)/;
-
-  const m = text.match(re);
-  if (!m) {
+    return {
+      ok: out.ok,
+      dateStr: out.dateStr,
+      midiBalls: out.midi,
+      asweBalls: out.aswe,
+      error: out.ok ? 0 : 2,
+      message: out.message || "",
+      source: NY_NUMBERS_URL
+    };
+  } catch (e) {
     return {
       ok: false,
-      message: "FL: pa rive li Pick 3 Midday/Evening sou paj la.",
       dateStr: "-",
       midiBalls: [],
-      asweBalls: []
+      asweBalls: [],
+      error: 2,
+      message: String(e?.message || e),
+      source: NY_NUMBERS_URL
     };
   }
+}
 
-  const dateHuman = `${m[1]}, ${m[2]} ${m[3]}, ${m[4]}`;
-  const dateStr = moment.tz(dateHuman, "dddd, MMMM D, YYYY", TZ).format("dddd, DD MMMM YYYY");
+// ===== Georgia parser (LotteryPost) =====
+function parseGAFromText(text) {
+  const t = String(text || "").replace(/\s+/g, " ").trim();
 
+  const dateRe = /([A-Za-z]+,\s+[A-Za-z]+\s+\d{1,2},\s+\d{4})/;
+  const dateMatch = t.match(dateRe);
+  const dateStr = dateMatch ? dateMatch[1] : "-";
+
+  // Midday digits
+  const midRe = /Midday.*?(\d)\D+(\d)\D+(\d)/;
+  const nightRe = /Night.*?(\d)\D+(\d)\D+(\d)/;
+  const eveRe = /Evening.*?(\d)\D+(\d)\D+(\d)/;
+
+  const mm = t.match(midRe);
+  const nn = t.match(nightRe) || t.match(eveRe);
+
+  const midi = mm ? [mm[1], mm[2], mm[3]] : [];
+  const aswe = nn ? [nn[1], nn[2], nn[3]] : [];
+
+  const ok = midi.length || aswe.length;
   return {
-    ok: true,
-    dateStr,
-    midiBalls: digits3FromMatch(m[5], m[6], m[7]),
-    asweBalls: digits3FromMatch(m[8], m[9], m[10]),
-    source: url
+    ok,
+    dateStr: ok ? fmtLongDate(dateStr) : "-",
+    midi,
+    aswe,
+    message: ok ? "" : "GA: pa rive li paj la (oswa li bloké)."
   };
 }
 
-// ---------- GEORGIA (LotteryPost - Cash 3 past) ----------
 async function fetchGA() {
-  const url = "https://www.lotterypost.com/results/ga/cash3/past";
-  const html = await safeFetch(url);
-  const text = normalizeText(cheerio.load(html).text());
+  try {
+    const res = await httpGet(GA_CASH3_URL);
+    const $ = cheerio.load(res.data);
+    const text = $("body").text();
+    const out = parseGAFromText(text);
 
-  // Paj la gen Midday / Evening / Night.
-  // Nou itilize Midday kòm "MIDI", epi Night kòm "ASWÈ" (paske se dènye tiraj la).
-  const re =
-    /(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),\s+(\d{4}).*?Midday.*?(\d)\D+(\d)\D+(\d).*?Night.*?(\d)\D+(\d)\D+(\d)/;
-
-  const m = text.match(re);
-  if (!m) {
+    return {
+      ok: out.ok,
+      dateStr: out.dateStr,
+      midiBalls: out.midi,
+      asweBalls: out.aswe,
+      error: out.ok ? 0 : 1,
+      message: out.message || "",
+      source: GA_CASH3_URL
+    };
+  } catch (e) {
     return {
       ok: false,
-      message: "GA: pa rive li Cash 3 Midday/Night sou paj la.",
       dateStr: "-",
       midiBalls: [],
-      asweBalls: []
+      asweBalls: [],
+      error: 1,
+      message: String(e?.message || e), // often 403
+      source: GA_CASH3_URL
     };
   }
-
-  const dateHuman = `${m[1]}, ${m[2]} ${m[3]}, ${m[4]}`;
-  const dateStr = moment.tz(dateHuman, "dddd, MMMM D, YYYY", TZ).format("dddd, DD MMMM YYYY");
-
-  return {
-    ok: true,
-    dateStr,
-    midiBalls: digits3FromMatch(m[5], m[6], m[7]),
-    asweBalls: digits3FromMatch(m[8], m[9], m[10]),
-    source: url
-  };
 }
 
-// ---------- Build response in your JSON structure ----------
-async function buildAll() {
-  // times (ET)
-  // FL Pick 3: 1:30 pm / 9:45 pm (sou LotteryPost li montre sa) :contentReference[oaicite:2]{index=2}
-  // NY Numbers: 2:30 pm / 10:30 pm (nou kenbe menm jan ou te mete)
-  // GA Cash 3: 12:29 pm / 11:34 pm (ofisyèl GA) :contentReference[oaicite:3]{index=3}
-  const [fl, ny, ga] = await Promise.allSettled([fetchFL(), fetchNY(), fetchGA()]);
-
-  function unwrap(p) {
-    if (p.status === "fulfilled") return p.value;
-    return { ok: false, message: String(p.reason?.message || p.reason), dateStr: "-", midiBalls: [], asweBalls: [] };
-  }
-
-  const FL = unwrap(fl);
-  const NY = unwrap(ny);
-  const GA = unwrap(ga);
+// ===== Build full payload =====
+async function buildPayload() {
+  const [fl, ny, ga] = await Promise.all([fetchFlorida(), fetchNY(), fetchGA()]);
 
   const items = [
     {
       state: "Florida Lottery",
-      dateStr: FL.dateStr || "-",
+      dateStr: fl.dateStr,
       gameMidi: "Florida | MIDI",
-      midiBalls: FL.ok ? FL.midiBalls : [],
+      midiBalls: fl.midiBalls,
       midiTarget: nextTargetISO(13, 30),
       gameAswe: "Florida | ASWÈ",
-      asweBalls: FL.ok ? FL.asweBalls : [],
+      asweBalls: fl.asweBalls,
       asweTarget: nextTargetISO(21, 45),
-      midiError: FL.ok ? 0 : 1,
-      midiMessage: FL.ok ? "" : (FL.message || "FL error"),
-      asweError: FL.ok ? 0 : 1,
-      asweMessage: FL.ok ? "" : (FL.message || "FL error"),
-      source: FL.source || ""
+      midiError: fl.error,
+      midiMessage: fl.message,
+      asweError: fl.error,
+      asweMessage: fl.message,
+      source: fl.source
     },
     {
       state: "New York Lottery",
-      dateStr: NY.dateStr || "-",
+      dateStr: ny.dateStr,
       gameMidi: "New York | MIDI",
-      midiBalls: NY.ok ? NY.midiBalls : [],
+      midiBalls: ny.midiBalls,
       midiTarget: nextTargetISO(14, 30),
       gameAswe: "New York | ASWÈ",
-      asweBalls: NY.ok ? NY.asweBalls : [],
+      asweBalls: ny.asweBalls,
       asweTarget: nextTargetISO(22, 30),
-      midiError: NY.ok ? 0 : 1,
-      midiMessage: NY.ok ? "" : (NY.message || "NY error"),
-      asweError: NY.ok ? 0 : 1,
-      asweMessage: NY.ok ? "" : (NY.message || "NY error"),
-      source: NY.source || ""
+      midiError: ny.error,
+      midiMessage: ny.message,
+      asweError: ny.error,
+      asweMessage: ny.message,
+      source: ny.source
     },
     {
       state: "Georgia Lottery",
-      dateStr: GA.dateStr || "-",
+      dateStr: ga.dateStr,
       gameMidi: "Georgia | MIDI",
-      midiBalls: GA.ok ? GA.midiBalls : [],
+      midiBalls: ga.midiBalls,
       midiTarget: nextTargetISO(12, 29),
       gameAswe: "Georgia | ASWÈ",
-      asweBalls: GA.ok ? GA.asweBalls : [],
+      asweBalls: ga.asweBalls,
       asweTarget: nextTargetISO(23, 34),
-      midiError: GA.ok ? 0 : 1,
-      midiMessage: GA.ok ? "" : (GA.message || "GA error"),
-      asweError: GA.ok ? 0 : 1,
-      asweMessage: GA.ok ? "" : (GA.message || "GA error"),
-      source: GA.source || ""
+      midiError: ga.error,
+      midiMessage: ga.message,
+      asweError: ga.error,
+      asweMessage: ga.message,
+      source: ga.source
     }
   ];
 
-  return { items, updatedAt: new Date().toISOString(), stale: false };
+  // If at least 1 state has real balls -> consider "good"
+  const hasAnyBalls = items.some(it => (it.midiBalls?.length || 0) > 0 || (it.asweBalls?.length || 0) > 0);
+
+  return {
+    items,
+    updatedAt: new Date().toISOString(),
+    stale: !hasAnyBalls
+  };
 }
 
-// ---------- ROUTES ----------
+// ===== Auto refresh loop =====
+async function refreshNow() {
+  if (STATE.refreshing) return;
+  STATE.refreshing = true;
+
+  try {
+    const payload = await buildPayload();
+
+    // Save as lastGood if it has any real balls
+    const hasAny = payload.items.some(it => (it.midiBalls?.length || 0) > 0 || (it.asweBalls?.length || 0) > 0);
+
+    STATE.payload = payload;
+    STATE.lastError = "";
+
+    if (hasAny) {
+      STATE.lastGood = payload;
+    } else if (STATE.lastGood) {
+      // keep old good data as stale fallback
+      STATE.payload = { ...STATE.lastGood, updatedAt: payload.updatedAt, stale: true, error: "Nou pa jwenn nouvo done; nap sèvi ak cache." };
+    }
+  } catch (e) {
+    STATE.lastError = String(e?.message || e);
+
+    if (STATE.lastGood) {
+      STATE.payload = { ...STATE.lastGood, updatedAt: new Date().toISOString(), stale: true, error: STATE.lastError };
+    } else {
+      STATE.payload = { items: [], updatedAt: new Date().toISOString(), stale: true, error: STATE.lastError };
+    }
+  } finally {
+    STATE.refreshing = false;
+  }
+}
+
+// start auto refresh
+setInterval(refreshNow, REFRESH_EVERY_MS);
+refreshNow();
+
+// ===== Routes =====
 app.get("/", (req, res) => res.json({ ok: true, message: "Lottery API Server running" }));
 
-app.get("/results", async (req, res) => {
-  try {
-    const now = Date.now();
-    if (CACHE.data && (now - CACHE.ts) < CACHE_MS) return res.json(CACHE.data);
-
-    const payload = await buildAll();
-    CACHE = { ts: now, data: payload };
-    return res.json(payload);
-  } catch (e) {
-    // si gen cache anvan, retounen li kòm stale
-    if (CACHE.data) {
-      return res.status(200).json({
-        ...CACHE.data,
-        stale: true,
-        error: String(e?.message || e)
-      });
-    }
-    return res.status(500).json({ items: [], updatedAt: new Date().toISOString(), stale: true, error: String(e?.message || e) });
-  }
+app.get("/results", (req, res) => {
+  res.json(STATE.payload);
 });
 
-// Debug rapid
-app.get("/health", (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    refreshing: STATE.refreshing,
+    updatedAt: STATE.payload.updatedAt,
+    stale: STATE.payload.stale,
+    lastError: STATE.lastError || ""
+  });
+});
 
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
