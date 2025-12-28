@@ -1,15 +1,18 @@
 {
-  "name": "lottery-api-server",
+  "name": "lottery-scraper",
   "version": "1.0.0",
-  "description": "Lottery Results API (Florida / New York / Georgia) - no key",
+  "description": "Lottery Results API (NO Magayo) - FL PDF + NY OpenData + GA Web",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
     "axios": "^1.6.0",
+    "cheerio": "^1.0.0-rc.12",
     "cors": "^2.8.5",
     "express": "^4.18.2",
-    "moment-timezone": "^0.5.43"
+    "moment-timezone": "^0.5.43",
+    "pdf-parse": "^1.1.1",
+    "xml2js": "^0.6.2"
   }
 }
